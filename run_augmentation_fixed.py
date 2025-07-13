@@ -2,14 +2,15 @@
 # -*- coding: utf-8 -*-
 
 """
-VAE-GAN数据增强模块 - 核心运行脚本
-直接修改下方配置参数，然后运行此文件
+简化版数据增强模块 - 使用PyTorch实现的时序数据增强
 """
 import os
 import sys
 import argparse
 import numpy as np
 import torch
+import torch.nn as nn
+import torch.optim as optim
 import matplotlib
 matplotlib.use('Agg')  # 设置无GUI后端
 import matplotlib.pyplot as plt
@@ -21,6 +22,33 @@ from tqdm import tqdm
 import glob
 import time
 import traceback
+import gc
+
+# 确保能找到其他模块
+current_dir = os.path.dirname(os.path.abspath(__file__))
+if current_dir not in sys.path:
+    sys.path.insert(0, current_dir)
+    
+parent_dir = os.path.dirname(current_dir)
+if parent_dir not in sys.path:
+    sys.path.insert(0, parent_dir)
+
+# 导入模型定义
+try:
+    # 尝试作为包导入
+    sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from dataaugment.vae_gan import VAE_GAN, plot_losses, generate_augmented_data, save_augmented_data as vae_gan_save_augmented_data
+    from dataaugment.gan import Discriminator # Import Discriminator to ensure its extract_features is available
+except ImportError as e:
+    print(f"无法导入必要的模块: {e}")
+    try:
+        # 尝试作为本地模块导入
+        sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+        from vae_gan import VAE_GAN, plot_losses, generate_augmented_data, save_augmented_data as vae_gan_save_augmented_data
+        from gan import Discriminator # Import Discriminator to ensure its extract_features is available
+    except ImportError as e:
+        print(f"第二次尝试导入失败: {e}")
+        raise ImportError("请确保在正确的目录运行，或将dataaugment添加到PYTHONPATH")
 
 # 安全地将PyTorch张量转换为NumPy数组的函数
 def safe_to_numpy(tensor):
@@ -40,662 +68,489 @@ def safe_to_numpy(tensor):
             print("无法转换张量到NumPy，将返回原始值")
             return tensor
 
-#################################################
-#             用户可修改的配置参数                #
-#################################################
-# 设置全局字体和图表参数
-plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'Arial Unicode MS']
-plt.rcParams['axes.unicode_minus'] = False
-plt.rcParams['figure.dpi'] = 150
-plt.rcParams['savefig.dpi'] = 300
-
-# 数据参数
-DATA_DIR = 'original'             # 数据目录
-OUTPUT_DIR = 'augmented_data'     # 输出目录
-MAX_SEQ_LEN = 400                 # 最大序列长度
-TEST_SIZE = 0.2                   # 测试集比例
-
-# 模型参数
-LATENT_DIM = 32                   # 潜在空间维度
-VAE_HIDDEN_DIMS = [256, 128, 64]  # VAE隐藏层维度 
-GEN_HIDDEN_DIMS = [64, 128, 256]  # 生成器隐藏层维度
-DISC_HIDDEN_DIMS = [256, 128, 64] # 判别器隐藏层维度
-DROPOUT_RATE = 0.1                # Dropout比率
-USE_SPECTRAL_NORM = True          # 使用谱归一化 
-USE_RESIDUAL = True               # 使用残差连接
-USE_ATTENTION = True              # 使用自注意力机制
-
-# 训练参数
-EPOCHS = 100                      # 训练轮数
-BATCH_SIZE = 16                   # 批量大小
-LEARNING_RATE = 0.001             # 学习率
-SAMPLES_PER_CLASS = 15            # 每类生成样本数
-
-# 损失函数权重
-LAMBDA_KL = 0.01                  # KL散度损失权重
-LAMBDA_REC = 10.0                 # 重构损失权重
-LAMBDA_GP = 5.0                   # 梯度惩罚权重
-LAMBDA_FM = 1.0                   # 特征匹配损失权重
-LAMBDA_CYCLE = 5.0                # 循环一致性损失权重
-
-# 其他参数
-SEED = 42                         # 随机种子
-USE_CUDA = True                   # 使用CUDA（如果可用）
-SAVE_MODEL = True                 # 保存模型
-
-#################################################
-
-# 确保能找到其他模块
-current_dir = os.path.dirname(os.path.abspath(__file__))
-if current_dir not in sys.path:
-    sys.path.insert(0, current_dir)
-    
-parent_dir = os.path.dirname(current_dir)
-if parent_dir not in sys.path:
-    sys.path.insert(0, parent_dir)
-
-# 导入模型定义
-try:
-    from dataaugment.vae import VAE
-    from dataaugment.gan import Generator, Discriminator
-    from dataaugment.vae_gan import VAE_GAN, train_vaegan, plot_losses, generate_augmented_data, save_augmented_data
-    from dataaugment.utils import load_data_files, normalize_data, clean_data, pad_or_truncate
-except ImportError:
-    try:
-        from vae import VAE
-        from gan import Generator, Discriminator
-        from vae_gan import VAE_GAN, train_vaegan, plot_losses, generate_augmented_data, save_augmented_data
-        from utils import load_data_files, normalize_data, clean_data, pad_or_truncate
-    except ImportError as e:
-        print(f"无法导入必要的模块: {e}")
-        raise ImportError("请确保在正确的目录运行，或将dataaugment添加到PYTHONPATH")
-
 def set_seed(seed):
-    """设置随机种子以确保结果可重复"""
-    np.random.seed(seed)
+    """设置随机种子，确保结果可复现"""
     torch.manual_seed(seed)
+    np.random.seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
-def parse_args():
-    """解析命令行参数"""
-    parser = argparse.ArgumentParser(description='VAE-GAN数据增强')
-    
-    # 数据参数
-    parser.add_argument('--data_dir', type=str, default=DATA_DIR, help='数据目录')
-    parser.add_argument('--file_pattern', type=str, default='*.csv', help='文件匹配模式')
-    parser.add_argument('--output_dir', type=str, default=OUTPUT_DIR, help='输出目录')
-    parser.add_argument('--max_seq_len', type=int, default=MAX_SEQ_LEN, help='最大序列长度')
-    parser.add_argument('--test_size', type=float, default=TEST_SIZE, help='测试集比例')
-    
-    # 模型参数
-    parser.add_argument('--latent_dim', type=int, default=LATENT_DIM, help='潜在空间维度')
-    parser.add_argument('--vae_hidden_dims', type=int, nargs='+', default=VAE_HIDDEN_DIMS, help='VAE隐藏层维度')
-    parser.add_argument('--gen_hidden_dims', type=int, nargs='+', default=GEN_HIDDEN_DIMS, help='生成器隐藏层维度')
-    parser.add_argument('--disc_hidden_dims', type=int, nargs='+', default=DISC_HIDDEN_DIMS, help='判别器隐藏层维度')
-    parser.add_argument('--dropout_rate', type=float, default=DROPOUT_RATE, help='Dropout率')
-    parser.add_argument('--use_spectral_norm', action='store_true', default=USE_SPECTRAL_NORM, help='使用谱归一化')
-    parser.add_argument('--use_residual', action='store_true', default=USE_RESIDUAL, help='使用残差连接')
-    parser.add_argument('--use_attention', action='store_true', default=USE_ATTENTION, help='使用自注意力机制')
-    
-    # 训练参数
-    parser.add_argument('--epochs', type=int, default=EPOCHS, help='训练轮数')
-    parser.add_argument('--batch_size', type=int, default=BATCH_SIZE, help='批量大小')
-    parser.add_argument('--learning_rate', type=float, default=LEARNING_RATE, help='学习率')
-    parser.add_argument('--beta1', type=float, default=0.5, help='Adam优化器的beta1参数')
-    parser.add_argument('--beta2', type=float, default=0.999, help='Adam优化器的beta2参数')
-    parser.add_argument('--lambda_kl', type=float, default=LAMBDA_KL, help='KL散度损失权重')
-    parser.add_argument('--lambda_rec', type=float, default=LAMBDA_REC, help='重构损失权重')
-    parser.add_argument('--lambda_gp', type=float, default=LAMBDA_GP, help='梯度惩罚权重')
-    parser.add_argument('--lambda_fm', type=float, default=LAMBDA_FM, help='特征匹配损失权重')
-    parser.add_argument('--lambda_cycle', type=float, default=LAMBDA_CYCLE, help='循环一致性损失权重')
-    parser.add_argument('--samples_per_class', type=int, default=SAMPLES_PER_CLASS, help='每个类别的目标样本数')
-    
-    # 其他参数
-    parser.add_argument('--seed', type=int, default=SEED, help='随机种子')
-    parser.add_argument('--no_cuda', action='store_true', help='不使用CUDA')
-    parser.add_argument('--save_model', action='store_true', default=SAVE_MODEL, help='保存模型')
-    
+def setup_args():
+    parser = argparse.ArgumentParser(description='时间序列数据增强')
+    parser.add_argument('--data_dir', type=str, default='./original1', help='原始数据目录')
+    parser.add_argument('--output_dir', type=str, default='./augmented_data', help='增强数据输出目录')
+    parser.add_argument('--checkpoint_dir', type=str, default='./checkpoints', help='模型检查点目录')
+    parser.add_argument('--viz_dir', type=str, default='./augmented_data', help='可视化输出目录')
+    parser.add_argument('--epochs', type=int, default=100, help='训练轮次')
+    parser.add_argument('--batch_size', type=int, default=32, help='批次大小')
+    parser.add_argument('--latent_dim', type=int, default=32, help='潜在空间维度')
+    parser.add_argument('--seq_length', type=int, default=400, help='序列长度')
+    parser.add_argument('--target_samples', type=int, default=25, help='每个类别的目标样本数')
+    parser.add_argument('--model', type=str, default='vae_gan', choices=['vae_gan'], help='使用的模型类型')
+    parser.add_argument('--device', type=str, default='cpu', help='训练设备')
     return parser.parse_args()
 
-def generate_test_data(num_samples=30, seq_length=100, num_features=10, num_classes=3):
-    """生成测试数据"""
-    X = np.random.randn(num_samples, seq_length, num_features)
-    y = np.array([i % num_classes for i in range(num_samples)])
-    return X, y
-
-def load_dataset(data_dir, file_pattern='*.csv', max_seq_len=None):
-    """加载数据集"""
+def load_data(data_dir, seq_length=None):
+    """加载并预处理数据"""
     print(f"从 {data_dir} 加载数据...")
     
-    try:
-        # 获取所有匹配的CSV文件
-        csv_files = glob.glob(os.path.join(data_dir, file_pattern))
-        
-        if not csv_files:
-            print(f"在 {data_dir} 中没有找到CSV文件，将使用测试数据")
-            X, y = generate_test_data(max_seq_len=max_seq_len)
-            return X, y
-        
-        print(f"找到 {len(csv_files)} 个CSV文件")
-        
-        # 加载数据文件
-        dataframes, labels = load_data_files(data_dir, file_pattern)
-        
-        if not dataframes or len(dataframes) == 0:
-            print("无法加载数据文件，将使用测试数据")
-            X, y = generate_test_data(max_seq_len=max_seq_len)
-            return X, y
-        
-        print(f"成功加载 {len(dataframes)} 个数据样本")
-        
-        # 处理数据
-        data_arrays = []
-        for df in dataframes:
-            # 提取数据
+    # 获取所有CSV文件
+    csv_files = [f for f in os.listdir(data_dir) if f.endswith('.csv')]
+    
+    # 初始化数据和标签列表
+    all_data = []
+    all_labels = []
+    
+    # 加载所有CSV文件
+    for file in tqdm(csv_files, desc="处理文件"):
+        file_path = os.path.join(data_dir, file)
+        try:
+            # 读取CSV文件
+            df = pd.read_csv(file_path)
+            
+            # 提取标签（假设最后一列是标签）
             if 'label' in df.columns:
-                sensor_data = df.drop('label', axis=1).values.astype(np.float32)
+                label = df['label'].iloc[0]
+                df = df.drop('label', axis=1)
             else:
-                sensor_data = df.values.astype(np.float32)
+                # 尝试从最后一列获取标签
+                label = df.iloc[0, -1]
+                df = df.iloc[:, :-1]
             
-            # 清理数据
-            sensor_data = clean_data(sensor_data)
+            # 转换为numpy数组
+            data = df.values
             
-            # 填充或截断序列
-            padded_data = pad_or_truncate(sensor_data, max_seq_len)
-            data_arrays.append(padded_data)
-        
-        # 堆叠所有数据
-        X = np.stack(data_arrays)
-        y = np.array(labels)
-        
-        print(f"处理后的数据形状: {X.shape}, 标签形状: {y.shape}")
-        return X, y
-        
-    except Exception as e:
-        print(f"加载数据时出错: {e}")
-        print("使用测试数据替代")
-        X, y = generate_test_data(max_seq_len=max_seq_len)
-        return X, y
+            # 添加到列表
+            all_data.append(data)
+            all_labels.append(label)
+        except Exception as e:
+            print(f"处理文件 {file} 时出错: {e}")
+    
+    # 确定最大序列长度
+    if seq_length is None:
+        seq_length = max([len(d) for d in all_data])
+        print(f"所有序列将被处理到长度: {seq_length}")
+    
+    # 填充/截断序列到相同长度
+    processed_data = []
+    for data in tqdm(all_data, desc="填充/截断数据"):
+        if len(data) > seq_length:
+            # 截断
+            processed_data.append(data[:seq_length])
+        else:
+            # 填充
+            padding = np.zeros((seq_length - len(data), data.shape[1]))
+            padded_data = np.vstack((data, padding))
+            processed_data.append(padded_data)
+    
+    # 转换为numpy数组
+    X = np.array(processed_data)
+    y = np.array(all_labels)
+    
+    # 归一化数据
+    print("归一化数据...")
+    X_norm = np.zeros_like(X)
+    for i in range(len(X)):
+        for j in range(X.shape[2]):
+            # 对每个特征进行归一化
+            feature = X[i, :, j]
+            min_val = np.min(feature)
+            max_val = np.max(feature)
+            if max_val > min_val:
+                X_norm[i, :, j] = (feature - min_val) / (max_val - min_val)
+            else:
+                X_norm[i, :, j] = 0
+    
+    print(f"\n数据集类别分布:")
+    unique_labels, counts = np.unique(y, return_counts=True)
+    for label, count in zip(unique_labels, counts):
+        print(f"类别 {label}: {count} 个样本")
+    
+    print(f"加载和预处理完成。数据形状: {X_norm.shape}, 标签形状: {y.shape}")
+    
+    return X_norm, y, seq_length
 
-def prepare_data(X, y, test_size=0.2, seed=42):
-    """准备训练和测试数据"""
-    # 获取数据形状
-    n_samples, n_timesteps, n_features = X.shape
+def prepare_datasets(X, y, batch_size, test_size=0.2):
+    """准备训练和测试数据集"""
+    print("准备训练/测试数据集...")
     
-    # 标准化数据
-    X_flat = X.reshape(-1, n_features)
-    scaler = MinMaxScaler()
-    X_flat_scaled = scaler.fit_transform(X_flat)
-    X_scaled = X_flat_scaled.reshape(n_samples, n_timesteps, n_features)
+    # 分割训练和测试集
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size, stratify=y, random_state=42)
     
-    # 分割数据集
-    X_train, X_test, y_train, y_test = train_test_split(
-        X_scaled, y, test_size=test_size, random_state=seed, stratify=y
-    )
+    # 打印训练集类别分布
+    print("\n训练集类别分布:")
+    unique_labels, counts = np.unique(y_train, return_counts=True)
+    for label, count in zip(unique_labels, counts):
+        print(f"类别 {label}: {count} 个样本")
     
-    # 重塑数据用于VAE
+    # 打印测试集类别分布
+    print("\n测试集类别分布:")
+    unique_labels, counts = np.unique(y_test, return_counts=True)
+    for label, count in zip(unique_labels, counts):
+        print(f"类别 {label}: {count} 个样本")
+    
+    print(f"\n训练集: {len(X_train)} 样本, 测试集: {len(X_test)} 样本\n")
+    
+    # 创建PyTorch数据集
+    # 重塑数据以适应VAE-GAN模型
     X_train_flat = X_train.reshape(X_train.shape[0], -1)
     X_test_flat = X_test.reshape(X_test.shape[0], -1)
     
-    # 创建PyTorch数据集和加载器
+    # 转换为PyTorch张量
     X_train_tensor = torch.FloatTensor(X_train_flat)
     y_train_tensor = torch.LongTensor(y_train)
     X_test_tensor = torch.FloatTensor(X_test_flat)
     y_test_tensor = torch.LongTensor(y_test)
     
-    train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
-    test_dataset = TensorDataset(X_test_tensor, y_test_tensor)
-    
-    return X_train, X_test, y_train, y_test, X_train_flat, train_dataset, test_dataset
-
-def create_and_train_model(args, train_dataset, input_dim, device):
-    """创建并训练VAE-GAN模型"""
-    print("\n创建并训练VAE-GAN模型...")
-    
     # 创建数据加载器
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
+    train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     
-    # 根据输入维度动态调整隐藏层维度
-    hidden_size = min(512, max(64, input_dim // 4))
+    test_dataset = TensorDataset(X_test_tensor, y_test_tensor)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
     
-    # 确保隐藏层维度合理
-    if not args.vae_hidden_dims or len(args.vae_hidden_dims) == 0:
-        args.vae_hidden_dims = [hidden_size * 2, hidden_size, hidden_size // 2]
-        print(f"自动设置VAE隐藏层: {args.vae_hidden_dims}")
-    
-    if not args.gen_hidden_dims or len(args.gen_hidden_dims) == 0:
-        args.gen_hidden_dims = [hidden_size // 2, hidden_size, hidden_size * 2]
-        print(f"自动设置生成器隐藏层: {args.gen_hidden_dims}")
-    
-    if not args.disc_hidden_dims or len(args.disc_hidden_dims) == 0:
-        args.disc_hidden_dims = [hidden_size * 2, hidden_size, hidden_size // 2]
-        print(f"自动设置判别器隐藏层: {args.disc_hidden_dims}")
-    
-    print(f"VAE隐藏层: {args.vae_hidden_dims}")
-    print(f"生成器隐藏层: {args.gen_hidden_dims}")
-    print(f"判别器隐藏层: {args.disc_hidden_dims}")
-    
-    try:
-        # 创建VAE-GAN模型
-        vaegan = VAE_GAN(
-            input_dim=input_dim, 
-            latent_dim=args.latent_dim,
-            hidden_dims_vae=args.vae_hidden_dims,
-            hidden_dims_gen=args.gen_hidden_dims,
-            hidden_dims_disc=args.disc_hidden_dims,
-            dropout_rate=args.dropout_rate,
-            spectral_norm_use=args.use_spectral_norm,
-            residual_use=args.use_residual,
-            attention_use=args.use_attention,
-            device=device
-        )
-        print("VAE-GAN模型创建成功")
-        
-        # 训练模型
-        print("\n开始训练模型...")
-        history = train_vaegan(
-            model=vaegan,
-            dataloader=train_loader,
-            device=device,
-            epochs=args.epochs,
-            lr=args.learning_rate,
-            betas=(args.beta1, args.beta2),
-            lambda_kl=args.lambda_kl,
-            lambda_rec=args.lambda_rec,
-            lambda_gp=args.lambda_gp,
-            lambda_fm=args.lambda_fm,
-            lambda_cycle=args.lambda_cycle,
-            save_dir=os.path.join(args.output_dir, 'models'),
-            verbose=True
-        )
-        print("模型训练完成")
-    except Exception as e:
-        print(f"模型训练出错: {e}")
-        print("尝试使用简化的模型配置...")
-        
-        # 使用更简单的配置
-        args.vae_hidden_dims = [128, 64]
-        args.gen_hidden_dims = [64, 128] 
-        args.disc_hidden_dims = [128, 64]
-        args.use_spectral_norm = False
-        args.use_residual = False
-        args.use_attention = False
-        
-        vaegan = VAE_GAN(
-            input_dim=input_dim, 
-            latent_dim=args.latent_dim,
-            hidden_dims_vae=args.vae_hidden_dims,
-            hidden_dims_gen=args.gen_hidden_dims,
-            hidden_dims_disc=args.disc_hidden_dims,
-            dropout_rate=args.dropout_rate,
-            spectral_norm_use=args.use_spectral_norm,
-            residual_use=args.use_residual,
-            attention_use=args.use_attention,
-            device=device
-        )
-        
-        history = train_vaegan(
-            model=vaegan,
-            dataloader=train_loader,
-            device=device,
-            epochs=min(args.epochs, 50),  # 减少轮次
-            lr=args.learning_rate,
-            betas=(args.beta1, args.beta2),
-            lambda_kl=args.lambda_kl,
-            lambda_rec=args.lambda_rec,
-            lambda_gp=args.lambda_gp,
-            lambda_fm=args.lambda_fm,
-            lambda_cycle=args.lambda_cycle,
-            save_dir=os.path.join(args.output_dir, 'models'),
-            verbose=True
-        )
-        print("简化模型训练完成")
-    
-    return vaegan, history
+    return X_train, y_train, train_loader, X_test, y_test, test_loader
 
-def generate_augmented_data(model, train_data, train_labels, target_samples_per_class, quality_threshold=0.7, device='cpu'):
-    """
-    为每个类别生成平衡的增强数据
+# 在VAE-GAN模型的train方法中修改，移除中间断点保存
+def train_vae_gan(X_train, y_train, train_loader, input_dim, latent_dim, epochs, device, viz_dir, checkpoint_dir):
+    """训练VAE-GAN模型"""
+    print("\n创建VAE-GAN模型...")
+    print(f"输入维度: {input_dim} (序列长度: {X_train.shape[1]}, 特征数: {X_train.shape[2]})")
     
-    参数:
-        model: 训练好的VAE-GAN模型
-        train_data: 训练数据，扁平化的形式 [n_samples, features]
-        train_labels: 训练标签 [n_samples]
-        target_samples_per_class: 每个类别需要的样本数
-        quality_threshold: 质量阈值，用于筛选生成的样本
-        device: 使用的设备 ('cpu' 或 'cuda')
+    # 创建VAE-GAN模型
+    model = VAE_GAN(
+            input_dim=input_dim,
+            latent_dim=latent_dim,
+        hidden_dims_vae=[256, 128],  # 减小隐藏层大小以节省内存
+        hidden_dims_gen=[128, 256],
+        hidden_dims_disc=[256, 128],
+        dropout_rate=0.3,
+        lr=2e-5,
+            device=device
+    ).to(device)
     
-    返回:
-        gen_data: 生成的增强数据 [n_samples, features]
-        gen_labels: 对应的标签 [n_samples]
-    """
-    # 确保模型处于评估模式
-    model.eval()
-    
-    # 获取类别信息
-    unique_labels = np.unique(train_labels)
-    
-    # 为每个类别生成样本
-    all_gen_data = []
-    all_gen_labels = []
-    
-    for label in unique_labels:
-        # 获取当前类别的样本数
-        current_samples = np.sum(train_labels == label)
+    # 训练模型
+    print(f"\n训练VAE-GAN模型 (Epochs: {epochs})...")
+    try:
+        # 修改训练参数，移除中间可视化和断点保存
+        history = model.train(
+            train_loader=train_loader,
+            epochs=epochs,
+            kl_weight=0.005,  # 降低KL散度权重以减少正则化
+            gan_weight=0.1,
+            gp_weight=10.0,
+            viz_interval=epochs,  # 设置为epochs值，这样只在最后保存可视化
+            checkpoint_interval=epochs,  # 设置为epochs值，这样只在最后保存检查点
+            viz_dir=viz_dir,
+            checkpoint_dir=checkpoint_dir
+        )
         
-        # 计算需要生成的样本数
-        samples_to_generate = max(0, target_samples_per_class - current_samples)
-        print(f"类别 {label}: 已有 {current_samples} 个样本，需要生成 {samples_to_generate} 个样本")
+        # 保存最终模型
+        model_save_path = os.path.join(checkpoint_dir, f"vae_gan_final.pt")
+        torch.save({
+            'vae_state_dict': model.vae.state_dict(),
+            'gen_state_dict': model.generator.state_dict(),
+            'disc_state_dict': model.discriminator.state_dict(),
+        }, model_save_path)
+        print(f"最终模型已保存到 {model_save_path}")
         
-        if samples_to_generate <= 0:
-            # 如果已经有足够的样本，从原始数据中随机选择
-            idx = np.random.choice(np.where(train_labels == label)[0], target_samples_per_class, replace=False)
-            selected_data = train_data[idx]
-            all_gen_data.append(selected_data)
-            all_gen_labels.extend([label] * len(selected_data))
+        # 只保存最终的损失图
+        if viz_dir:
+            os.makedirs(viz_dir, exist_ok=True)
+            
+            # 绘制所有损失
+            plt.figure(figsize=(12, 8))
+            for key in history:
+                if key.endswith('loss'):
+                    plt.plot(history[key], label=key)
+            plt.title('训练损失曲线')
+            plt.xlabel('Epochs')
+            plt.ylabel('Loss')
+            plt.legend()
+            plt.grid(True)
+            plt.savefig(os.path.join(viz_dir, "final_losses.png"))
+            plt.close()
+        
+        return model
+    
+    except Exception as e:
+        print(f"训练VAE-GAN模型时出错: {e}")
+        traceback.print_exc()
+        return None
+
+def generate_augmented_data_vae_gan(model, X_train, y_train, target_samples_per_class, device):
+    """使用VAE-GAN生成增强数据"""
+    print("\n使用VAE-GAN生成增强数据...")
+    
+    # 获取唯一类别和每个类别的样本数
+    unique_classes = np.unique(y_train)
+    class_counts = {cls: np.sum(y_train == cls) for cls in unique_classes}
+    
+    # 打印每个类别的原始样本数
+    print("原始样本数:")
+    for cls, count in class_counts.items():
+        print(f"类别 {cls}: {count} 样本")
+    
+    # 计算每个类别需要生成的样本数
+    samples_to_generate = {
+        cls: max(0, target_samples_per_class - count) 
+        for cls, count in class_counts.items()
+    }
+    
+    print("\n需要生成的样本数:")
+    for cls, count in samples_to_generate.items():
+        print(f"类别 {cls}: {count} 样本")
+    
+    # 初始化生成数据和标签列表
+    generated_data = []
+    generated_labels = []
+    
+    # 对每个类别生成数据
+    for cls in unique_classes:
+        if samples_to_generate[cls] <= 0:
+            print(f"类别 {cls} 已有足够样本，跳过生成")
             continue
         
-        # 获取该类别的所有样本
-        class_data = train_data[train_labels == label]
+        # 获取该类别的训练数据
+        class_indices = np.where(y_train == cls)[0]
+        X_class = X_train[class_indices]
         
-        # 将原始样本添加到结果中
-        all_gen_data.append(class_data)
-        all_gen_labels.extend([label] * len(class_data))
+        # 重塑数据以适应VAE-GAN模型
+        X_class_flat = X_class.reshape(X_class.shape[0], -1)
+        X_class_tensor = torch.FloatTensor(X_class_flat).to(device)
         
-        # 如果需要生成额外的样本
-        if samples_to_generate > 0:
-            # 转换为torch张量
-            class_data_tensor = torch.FloatTensor(class_data).to(device)
+        print(f"为类别 {cls} 生成 {samples_to_generate[cls]} 个样本...")
+        
+        # 生成样本
+        gen_samples = []
+        batch_size = min(32, samples_to_generate[cls])  # 批量生成以减少内存使用
+        
+        for i in range(0, samples_to_generate[cls], batch_size):
+            n_to_generate = min(batch_size, samples_to_generate[cls] - i)
             
-            # 生成样本的数量 (生成更多以便筛选)
-            n_to_generate = int(samples_to_generate * 1.5) + 10
+            # 随机选择原始样本作为参考
+            random_indices = np.random.choice(len(X_class), n_to_generate)
+            reference_samples = X_class_tensor[random_indices]
             
-            # 批量生成
-            batch_size = 32
-            generated_samples = []
-            
-            for i in range(0, n_to_generate, batch_size):
-                current_batch_size = min(batch_size, n_to_generate - i)
+            # 生成样本
+            with torch.no_grad():
+                # 编码参考样本
+                mu, log_var = model.vae.encode(reference_samples)
                 
-                # 从该类别的数据中随机选择样本进行编码
-                indices = np.random.choice(len(class_data), current_batch_size, replace=True)
-                batch_data = class_data_tensor[indices]
+                # 添加随机噪声以增加多样性
+                z = model.vae.reparameterize(mu, log_var)
+                z = z + torch.randn_like(z) * 0.1  # 添加少量噪声
                 
-                # 生成新样本
-                try:
-                    with torch.no_grad():
-                        # 编码
-                        mu, log_var = model.vae.encode(batch_data)
-                        
-                        # 重参数化
-                        std = torch.exp(0.5 * log_var)
-                        eps = torch.randn_like(std)
-                        z = mu + eps * std
-                        
-                        # 添加一些随机噪声以增加多样性
-                        z = z + torch.randn_like(z) * 0.1
-                        
-                        # 解码
-                        reconstructed = model.vae.decode(z)
-                        
-                        # 使用生成器进一步增强
-                        enhanced = model.generator(reconstructed)
-                        
-                        # 评估质量
-                        quality_scores = model.discriminator(enhanced).detach().cpu().numpy().flatten()
-                        
-                        # 转换为numpy数组 - 使用安全转换函数
-                        enhanced = safe_to_numpy(enhanced)
-                        
-                        # 根据质量得分筛选样本
-                        for j, (sample, score) in enumerate(zip(enhanced, quality_scores)):
-                            if score > quality_threshold:
-                                generated_samples.append(sample)
-                except Exception as e:
-                    print(f"批次 {i} 样本生成出错: {e}")
-                    traceback.print_exc()
-            
-            # 确保有足够的样本
-            if len(generated_samples) < samples_to_generate:
-                print(f"警告: 类别 {label} 只生成了 {len(generated_samples)} 个高质量样本，少于目标 {samples_to_generate}")
-                # 如果生成的高质量样本不足，从原始样本中随机复制
-                additional_needed = samples_to_generate - len(generated_samples)
-                if len(class_data) > 0:
-                    additional_samples = class_data[np.random.choice(len(class_data), additional_needed, replace=True)]
-                    generated_samples.extend(additional_samples)
-            
-            # 选择所需数量的样本
-            selected_samples = generated_samples[:samples_to_generate]
-            
-            # 添加到结果中
-            all_gen_data.append(np.array(selected_samples))
-            all_gen_labels.extend([label] * len(selected_samples))
+                # 解码生成新样本
+                generated = model.vae.decode(z)
+                
+                # 转换为NumPy数组
+                generated_np = safe_to_numpy(generated)
+                
+                # 重塑回原始形状
+                generated_np = generated_np.reshape(-1, X_class.shape[1], X_class.shape[2])
+                
+                gen_samples.append(generated_np)
+        
+        # 合并所有生成的样本
+        gen_samples = np.vstack(gen_samples) if len(gen_samples) > 0 else np.array([])
+        
+        # 添加到生成数据列表
+        generated_data.append(gen_samples)
+        generated_labels.append(np.full(len(gen_samples), cls))
     
-    # 合并所有生成的数据
-    try:
-        gen_data = np.vstack(all_gen_data)
-        gen_labels = np.array(all_gen_labels)
-    except Exception as e:
-        print(f"合并生成数据时出错: {e}")
-        # 尝试手动合并
-        print("尝试手动合并数据...")
-        gen_data_list = []
-        for data_arr in all_gen_data:
-            if isinstance(data_arr, np.ndarray):
-                for row in data_arr:
-                    gen_data_list.append(row)
-        gen_data = np.array(gen_data_list)
-        gen_labels = np.array(all_gen_labels)
+    # 合并所有类别的生成数据
+    if generated_data:
+        generated_data = np.vstack(generated_data)
+        generated_labels = np.concatenate(generated_labels)
+        
+        print(f"VAE-GAN生成的数据形状: {generated_data.shape}, 标签形状: {generated_labels.shape}")
+        
+        # 检查生成数据的类别分布
+        print("\nVAE-GAN生成数据的类别分布:")
+        unique_labels, counts = np.unique(generated_labels, return_counts=True)
+        for label, count in zip(unique_labels, counts):
+            print(f"类别 {label}: {count} 个样本")
+    else:
+        print("没有生成任何数据")
+        generated_data = np.array([])
+        generated_labels = np.array([])
     
-    # 随机打乱数据
-    shuffle_idx = np.random.permutation(len(gen_labels))
-    gen_data = gen_data[shuffle_idx]
-    gen_labels = gen_labels[shuffle_idx]
-    
-    return gen_data, gen_labels
+    return generated_data, generated_labels
 
-def save_augmented_data(augmented_data, augmented_labels, output_dir, prefix='augmented_data'):
-    """
-    保存增强的数据
+def combine_data(original_data, original_labels, gen_data_vae, gen_labels_vae, target_samples_per_class):
+    """合并原始数据和生成的数据"""
+    print("\n合并原始数据和生成的数据...")
     
-    参数:
-        augmented_data: 增强数据
-        augmented_labels: 增强数据的标签
-        output_dir: 输出目录
-        prefix: 文件名前缀
-    """
-    try:
-        # 确保输出目录存在
-        os.makedirs(output_dir, exist_ok=True)
+    # 获取唯一类别
+    unique_classes = np.unique(original_labels)
+    
+    # 初始化合并后的数据和标签列表
+    combined_data = []
+    combined_labels = []
+    
+    # 对每个类别处理数据
+    for cls in unique_classes:
+        # 获取原始数据中该类别的样本
+        orig_indices = np.where(original_labels == cls)[0]
+        orig_data_cls = original_data[orig_indices]
         
-        # 确保数据是NumPy数组
-        augmented_data = safe_to_numpy(augmented_data)
-        augmented_labels = safe_to_numpy(augmented_labels)
+        # 添加所有原始样本
+        combined_data.append(orig_data_cls)
+        combined_labels.append(np.full(len(orig_data_cls), cls))
         
-        # 保存整个数据集为单个文件
-        np.savez(os.path.join(output_dir, f"{prefix}set.npz"), 
-                data=augmented_data, 
-                labels=augmented_labels)
+        # 计算已有样本数
+        current_count = len(orig_data_cls)
         
-        # 单独保存每个样本为CSV
-        for i in range(len(augmented_data)):
-            try:
-                sample = augmented_data[i]
-                label = augmented_labels[i]
+        # 如果有VAE-GAN生成的数据，添加它们
+        if len(gen_data_vae) > 0:
+            vae_indices = np.where(gen_labels_vae == cls)[0]
+            if len(vae_indices) > 0:
+                vae_data_cls = gen_data_vae[vae_indices]
                 
-                # 如果样本是序列形式，将其展平
-                if len(sample.shape) > 1:
-                    sample = sample.reshape(1, -1)
-                    
-                # 创建DataFrame
-                df = pd.DataFrame(sample)
-                df['label'] = label
+                # 计算还需要多少样本
+                samples_needed = target_samples_per_class - current_count
                 
-                # 保存为CSV
-                df.to_csv(os.path.join(output_dir, f"{prefix}_{i+1}.csv"), index=False)
-            except Exception as e:
-                print(f"保存样本 {i} 时出错: {e}")
+                if samples_needed > 0:
+                    # 如果VAE-GAN生成的样本不够，全部使用
+                    if len(vae_data_cls) <= samples_needed:
+                        combined_data.append(vae_data_cls)
+                        combined_labels.append(np.full(len(vae_data_cls), cls))
+                        current_count += len(vae_data_cls)
+                    else:
+                        # 否则只使用需要的数量
+                        combined_data.append(vae_data_cls[:samples_needed])
+                        combined_labels.append(np.full(samples_needed, cls))
+                        current_count += samples_needed
         
-        print(f"已保存 {len(augmented_data)} 个增强数据样本到 {output_dir}")
-    except Exception as e:
-        print(f"保存增强数据时出错: {e}")
-        traceback.print_exc()
+        print(f"类别 {cls}: 合并后共有 {current_count} 个样本")
+    
+    # 合并所有类别的数据
+    combined_data = np.vstack(combined_data) if combined_data else np.array([])
+    combined_labels = np.concatenate(combined_labels) if combined_labels else np.array([])
+    
+    print(f"合并后的数据形状: {combined_data.shape}, 标签形状: {combined_labels.shape}")
+    
+    # 检查合并后的类别分布
+    print("\n合并后的类别分布:")
+    unique_labels, counts = np.unique(combined_labels, return_counts=True)
+    for label, count in zip(unique_labels, counts):
+        print(f"类别 {label}: {count} 个样本 ({count/len(combined_labels)*100:.1f}%)")
+    
+    return combined_data, combined_labels
+
+def save_augmented_data(augmented_data, augmented_labels, output_dir):
+    """保存增强后的数据到CSV文件"""
+    print(f"\n保存增强数据到 {output_dir}...")
+    
+    # 创建输出目录
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # 获取唯一类别
+    unique_classes = np.unique(augmented_labels)
+    
+    # 保存每个样本到单独的CSV文件
+    for i in range(len(augmented_data)):
+        # 获取样本和标签
+        sample = augmented_data[i]
+        label = augmented_labels[i]
+            
+        # 创建DataFrame
+        df = pd.DataFrame(sample)
+        
+        # 添加标签列
+        df['label'] = label
+        
+        # 保存到CSV文件
+        file_path = os.path.join(output_dir, f"augmented_data_{i}.csv")
+        df.to_csv(file_path, index=False)
+    
+    # 保存整个数据集为NPZ文件
+    np.savez(
+        os.path.join(output_dir, "augmented_dataset.npz"),
+        data=augmented_data,
+        labels=augmented_labels
+    )
+    
+    # 绘制类别分布
+    plt.figure(figsize=(10, 6))
+    unique_labels, counts = np.unique(augmented_labels, return_counts=True)
+    plt.bar(unique_labels, counts)
+    plt.title('Class Distribution')
+    plt.xlabel('Class')
+    plt.ylabel('Count')
+    plt.xticks(unique_labels)
+    plt.grid(True, axis='y')
+    
+    # 添加数量和百分比标签
+    for i, (label, count) in enumerate(zip(unique_labels, counts)):
+        percentage = count / len(augmented_labels) * 100
+        plt.text(label, count + 0.1, f"{count}\n({percentage:.1f}%)", 
+                ha='center', va='bottom')
+    
+    plt.savefig(os.path.join(output_dir, "class_distribution.png"))
+    plt.close()
+    
+    print(f"已保存 {len(augmented_data)} 个样本到 {output_dir}")
+    print(f"类别分布图已保存到 {os.path.join(output_dir, 'class_distribution.png')}")
 
 def main():
-    """主函数"""
     # 解析命令行参数
-    args = parse_args()
+    args = setup_args()
     
     # 设置随机种子
-    set_seed(args.seed)
+    set_seed(42)
+    
+    # 设置设备
+    device = torch.device(args.device if torch.cuda.is_available() and args.device != 'cpu' else "cpu")
+    print(f"使用设备: {device}")
     
     # 创建输出目录
     os.makedirs(args.output_dir, exist_ok=True)
-    os.makedirs(os.path.join(args.output_dir, 'models'), exist_ok=True)
+    os.makedirs(args.checkpoint_dir, exist_ok=True)
+    os.makedirs(args.viz_dir, exist_ok=True)
     
-    # 设置设备
-    use_cuda = torch.cuda.is_available() and not args.no_cuda
-    device = torch.device("cuda" if use_cuda else "cpu")
-    print(f"使用设备: {device}")
+    # 加载数据
+    X, y, seq_length = load_data(args.data_dir, args.seq_length)
     
-    # 1. 加载原始数据
-    X, y = load_dataset(args.data_dir, args.file_pattern, args.max_seq_len)
+    # 准备数据集
+    X_train, y_train, train_loader, X_test, y_test, test_loader = prepare_datasets(X, y, args.batch_size)
     
-    if len(X) == 0:
-        print("错误：未能成功加载数据。请检查数据目录和文件格式。")
-        return
+    # 计算输入维度
+    input_dim = X_train.shape[1] * X_train.shape[2]
     
-    # 打印类别分布
-    unique_labels = np.unique(y)
-    print("\n原始数据类别分布:")
-    for label in unique_labels:
-        count = np.sum(y == label)
-        print(f"类别 {label}: {count} 个样本")
+    # 训练VAE-GAN模型
+    vae_gan_model = None
+    if args.model == 'vae_gan':
+        vae_gan_model = train_vae_gan(
+            X_train, y_train, train_loader, input_dim, args.latent_dim, 
+            args.epochs, device, args.viz_dir, args.checkpoint_dir
+        )
     
-    # 2. 准备数据
-    X_train, X_test, y_train, y_test, X_train_flat, train_dataset, test_dataset = prepare_data(
-        X, y, args.test_size, args.seed
+    # 生成增强数据
+    gen_data_vae, gen_labels_vae = np.array([]), np.array([])
+    
+    if vae_gan_model is not None:
+        gen_data_vae, gen_labels_vae = generate_augmented_data_vae_gan(
+            vae_gan_model, X_train, y_train, args.target_samples, device
+        )
+    
+    # 合并数据
+    augmented_data, augmented_labels = combine_data(
+        X_train, y_train, gen_data_vae, gen_labels_vae, args.target_samples
     )
     
-    # 获取输入维度
-    input_dim = X_train_flat.shape[1]
-    print(f"\n输入维度: {input_dim}")
-    print(f"训练集: {len(X_train)} 样本, 测试集: {len(X_test)} 样本")
-    
-    # 动态调整隐藏层维度
-    hidden_size = min(512, max(64, input_dim // 4))
-    if len(args.gen_hidden_dims) == 0:
-        args.gen_hidden_dims = [hidden_size // 2, hidden_size, hidden_size * 2]
-        print(f"自动设置生成器隐藏层: {args.gen_hidden_dims}")
-    
-    # 3. 创建并训练模型
-    vaegan, history = create_and_train_model(args, train_dataset, input_dim, device)
-    
-    # 4. 保存训练损失图
-    print("\n保存训练损失曲线...")
-    try:
-        loss_plot_path = os.path.join(args.output_dir, 'training_losses.png')
-        plot_losses(history, save_path=loss_plot_path)
-    except Exception as e:
-        print(f"保存损失曲线出错: {e}")
-    
-    # 5. 生成增强数据
-    print("\n生成增强数据...")
-    try:
-        # 生成均衡的数据集
-        try:
-            gen_data_flat, gen_labels = generate_augmented_data(
-                model=vaegan,
-                data_loader=train_dataset,
-                samples_per_class=args.samples_per_class,
-                device=device,
-                output_dir=args.output_dir
-            )
-        except Exception as e:
-            print(f"生成增强数据时出错: {str(e)}")
-            try:
-                # 回退到使用随机生成
-                print("尝试使用随机生成样本...")
-                gen_data_flat = np.random.randn(args.samples_per_class * len(np.unique(y_train)), X_train_flat.shape[1])
-                gen_labels = np.repeat(np.unique(y_train), args.samples_per_class)
-            except Exception as e2:
-                print(f"随机生成样本也失败了: {str(e2)}")
-                gen_data_flat = np.array([])
-                gen_labels = np.array([])
-        
-        # 6. 重塑数据回序列格式
-        seq_len, feat_dim = X_train.shape[1], X_train.shape[2]
-        
-        # 确保生成的数据与原始数据具有相同的特征维度
-        if gen_data_flat.shape[1] != X_train_flat.shape[1]:
-            print(f"警告: 生成数据的特征维度 ({gen_data_flat.shape[1]}) 与原始数据 ({X_train_flat.shape[1]}) 不匹配")
-            
-            # 计算每个时间步的特征数
-            orig_feat_per_step = X_train.shape[2]
-            gen_feat_per_step = gen_data_flat.shape[1] // seq_len
-            
-            print(f"原始数据每个时间步的特征数: {orig_feat_per_step}")
-            print(f"生成数据每个时间步的特征数: {gen_feat_per_step}")
-            
-            # 调整生成数据的维度
-            if gen_feat_per_step > orig_feat_per_step:
-                # 如果生成的特征维度更大，截断到原始维度
-                print("截断生成数据的特征维度以匹配原始数据...")
-                gen_data_reshaped = gen_data_flat.reshape(-1, seq_len, gen_feat_per_step)
-                gen_data = gen_data_reshaped[:, :, :orig_feat_per_step]
-            else:
-                # 如果生成的特征维度更小，填充到原始维度
-                print("填充生成数据的特征维度以匹配原始数据...")
-                gen_data = np.zeros((gen_data_flat.shape[0], seq_len, orig_feat_per_step))
-                gen_data_reshaped = gen_data_flat.reshape(-1, seq_len, gen_feat_per_step)
-                gen_data[:, :, :gen_feat_per_step] = gen_data_reshaped
-        else:
-            # 维度匹配，直接重塑
-            gen_data = gen_data_flat.reshape(-1, seq_len, feat_dim)
-        
-        print(f"最终生成数据形状: {gen_data.shape}")
-        
-        # 7. 保存增强数据
-        print("\n保存增强数据...")
-        save_augmented_data(
-            augmented_data=gen_data,
-            augmented_labels=gen_labels,
-            output_dir=args.output_dir,
-            prefix='augmented_data'
-        )
-        
-        print(f"原始训练数据: {len(X_train)} 个样本")
-        print(f"增强数据: {len(gen_data)} 个样本")
-    except Exception as e:
-        print(f"生成或保存增强数据时出错: {e}")
-    
-    # 8. 保存模型
-    if args.save_model:
-        print("\n保存模型...")
-        try:
-            # 确保模型保存目录存在
-            models_dir = os.path.join(args.output_dir, 'models')
-            os.makedirs(models_dir, exist_ok=True)
-            model_path = os.path.join(models_dir, 'vae_gan_model.pt')
-            
-            # 保存模型
-            torch.save({
-                'vae_state_dict': vaegan.vae.state_dict(),
-                'gen_state_dict': vaegan.generator.state_dict(),
-                'disc_state_dict': vaegan.discriminator.state_dict(),
-            }, model_path)
-            
-            print(f"模型已保存到 {model_path}")
-        except Exception as e:
-            print(f"保存模型时出错: {e}")
+    # 保存增强数据
+    save_augmented_data(augmented_data, augmented_labels, args.output_dir)
     
     print("\n数据增强完成!")
-    print(f"文件已保存在 {args.output_dir}")
-    print("\n生成数据可视化请使用 visualization.py 脚本")
 
 if __name__ == "__main__":
-    main() 
+    try:
+        main() 
+    except Exception as e:
+        print(f"执行过程中出错: {e}")
+        traceback.print_exc() 
